@@ -325,6 +325,7 @@ endsubroutine helper_loop
   use Diagnostics,     only: write_1daverages_prepare, save_name, &
                              diagnostics_clean_up, write_2daverages_prepare
   use Filter,          only: rmwig, rmwig_xyaverage
+  use Ft_inject,       only: inject_failure
   use Fixed_point,     only: fixed_points_prepare
   use Forcing,         only: addforce
   use General,         only: touch_file
@@ -527,6 +528,8 @@ endsubroutine helper_loop
 !  Possibility of logspacing for time series output
 !
     if (lit1_logspacing.and.real(t)<tmax_logspacing) lout=lspec 
+
+    call inject_failure(it)
 !
 !  Time advance.
 !

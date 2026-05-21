@@ -414,9 +414,14 @@
 !
 !  Communicators
 !
-  integer :: MPI_COMM_GRID, MPI_COMM_PENCIL
-  integer :: MPI_COMM_XBEAM,MPI_COMM_YBEAM,MPI_COMM_ZBEAM
-  integer :: MPI_COMM_XYPLANE,MPI_COMM_XZPLANE,MPI_COMM_YZPLANE,MPI_COMM_RSLICE
+  integer :: MPI_COMM_GRID=MPI_COMM_NULL, MPI_COMM_PENCIL=MPI_COMM_NULL
+  integer :: MPI_COMM_XBEAM=MPI_COMM_NULL, &
+             MPI_COMM_YBEAM=MPI_COMM_NULL, &
+             MPI_COMM_ZBEAM=MPI_COMM_NULL
+  integer :: MPI_COMM_XYPLANE=MPI_COMM_NULL, &
+             MPI_COMM_XZPLANE=MPI_COMM_NULL, &
+             MPI_COMM_YZPLANE=MPI_COMM_NULL, &
+             MPI_COMM_RSLICE=MPI_COMM_NULL
   integer :: root_rslice
 !
 ! for protecting MPI_COMM_WORLD to be redefined by preprocessor

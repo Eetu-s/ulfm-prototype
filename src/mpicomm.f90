@@ -50,8 +50,13 @@
 module Mpicomm
 !
   use Cdata
-  use General, only: find_proc, ioptest,loptest, idiv
+  use General, only: find_proc, find_proc_coords, ioptest,loptest, idiv
   use Yinyang
+  use Ft_mpi, only: ft_init, ft_check, ft_repair, pc_comm_active, &
+                    pc_comm_world, pc_is_spare, pc_was_promoted, &
+                    pc_need_restart_step, pc_n_spares, &
+                    pc_world_rank, &
+                    ft_set_neighbour_comm_setup, ft_set_topology_verify
 !
   implicit none
 !
@@ -222,10 +227,18 @@ module Mpicomm
 !$    if (.false.) &
       call MPI_INIT(mpierr)
 !
-! Size and rank w.r.t. MPI_COMM_WORLD
+
+!  Register the recovery callbacks BEFORE ft_init: the spare branch
+!  of ft_init blocks in MPIX_Comm_shrink until a failure occurs and
+!  only returns via ft_join_after_shrink, so callbacks registered
+!  after ft_init are never set on the spare.
 !
-      call MPI_COMM_SIZE(MPI_COMM_WORLD, nprocs, mpierr)
-      call MPI_COMM_RANK(MPI_COMM_WORLD, iproc, mpierr)
+      call ft_set_neighbour_comm_setup(setup_neighbour_comms)
+      call ft_set_topology_verify(verify_topology_after_recovery)
+      call ft_init(1)
+!
+      call MPI_COMM_SIZE(pc_comm_active, nprocs, mpierr)
+      call MPI_COMM_RANK(pc_comm_active, iproc, mpierr)
 !
 ! Let each process know on which node each process runs in array nodenames (can be exploited for signalling).
 !
@@ -237,20 +250,14 @@ module Mpicomm
 !
 !if (lroot) print*, 'Pencil0: nprocs,MPI_COMM_WORLD', nprocs, MPI_COMM_WORLD
 !
-! If mpirun/mpiexec calls also other applications than Pencil:
-! Get rank within the set of applications, iapp.
-! iapp=0 if there is only one application or Pencil is the first one.
-!
-      call MPI_COMM_GET_ATTR(MPI_COMM_WORLD, MPI_APPNUM, iapp, flag, mpierr)
       iapp=0   !!!
 !
-! New comm MPI_COMM_PENCIL which comprises only the procs of the Pencil
-! application. iproc becomes rank in MPI_COMM_PENCIL.
-! Attention: If there is more than one application envisaged, Pencil needs to be compiled
-! with FPPFLAGS=-fpp -DMPI_COMM_WORLD=MPI_COMM_PENCIL.
-! If there is only one application, iproc is unchanged and MPI_COMM_PENCIL=MPI_COMM_WORLD.
+! MPI_COMM_PENCIL is a duplicate of pc_comm_active. With n_spares=0
+! this is equivalent to the original split off MPI_COMM_WORLD; with
+! n_spares>0 spares are excluded. ft_repair will rebuild PENCIL/GRID
+! (via setup_neighbour_comms) when a failure is recovered.
 !
-      call MPI_COMM_SPLIT(MPI_COMM_WORLD, iapp, iproc, MPI_COMM_PENCIL, mpierr)
+      call MPI_COMM_DUP(pc_comm_active, MPI_COMM_PENCIL, mpierr)
       call MPI_COMM_SIZE(MPI_COMM_PENCIL, nprocs_penc, mpierr)
       call MPI_COMM_RANK(MPI_COMM_PENCIL, iproc, mpierr)
 !
@@ -556,23 +563,176 @@ module Mpicomm
 !
 !  Define MPI communicators that include all processes sharing the same value
 !  of ipx, ipy, or ipz. Refer to MPI_COMM_GRID!
-!  The rank within MPI_COMM_GRID is given by a
-!  combination of the two other directional processor indices.
 !
-      call MPI_COMM_SPLIT(MPI_COMM_GRID, ipy+nprocy*ipz, ipx, &
-                          MPI_COMM_XBEAM, mpierr)
-      call MPI_COMM_SPLIT(MPI_COMM_GRID, ipx+nprocx*ipz, ipy, &
-                          MPI_COMM_YBEAM, mpierr)
-      call MPI_COMM_SPLIT(MPI_COMM_GRID, ipx+nprocx*ipy, ipz, &
-                          MPI_COMM_ZBEAM, mpierr)
-      call MPI_COMM_SPLIT(MPI_COMM_GRID, ipz, ipx+nprocx*ipy, &
-                          MPI_COMM_XYPLANE, mpierr)
-      call MPI_COMM_SPLIT(MPI_COMM_GRID, ipy, ipx+nprocx*ipz, &
-                          MPI_COMM_XZPLANE, mpierr)
-      call MPI_COMM_SPLIT(MPI_COMM_GRID, ipx, ipy+nprocy*ipz, &
-                          MPI_COMM_YZPLANE, mpierr)
+      call setup_neighbour_comms(MPI_COMM_GRID)
 !
     endsubroutine initialize_mpicomm
+!***********************************************************************
+    subroutine setup_neighbour_comms(parent_comm)
+
+      integer, intent(in) :: parent_comm
+      integer :: ierr
+
+      if (.not. (lyinyang .or. lcubed_sphere)) then
+        call MPI_Comm_rank(parent_comm, iproc, ierr)
+        call find_proc_coords(iproc, ipx, ipy, ipz)
+        lroot = (iproc == root)
+        lfirst_proc_x = (ipx == 0)
+        lfirst_proc_y = (ipy == 0)
+        lfirst_proc_z = (ipz == 0)
+        lfirst_proc_xy  = lfirst_proc_x .and. lfirst_proc_y
+        lfirst_proc_yz  = lfirst_proc_y .and. lfirst_proc_z
+        lfirst_proc_xz  = lfirst_proc_x .and. lfirst_proc_z
+        lfirst_proc_xyz = lfirst_proc_x .and. lfirst_proc_y .and. lfirst_proc_z
+        llast_proc_x = (ipx == nprocx-1)
+        llast_proc_y = (ipy == nprocy-1)
+        llast_proc_z = (ipz == nprocz-1)
+        llast_proc_xy  = llast_proc_x .and. llast_proc_y
+        llast_proc_yz  = llast_proc_y .and. llast_proc_z
+        llast_proc_xz  = llast_proc_x .and. llast_proc_z
+        llast_proc_xyz = llast_proc_x .and. llast_proc_y .and. llast_proc_z
+        lcorner_yz = (lfirst_proc_y .or. llast_proc_y) .and. &
+                     (lfirst_proc_z .or. llast_proc_z)
+        xlneigh = find_proc(ipx-1, ipy,   ipz  )
+        xuneigh = find_proc(ipx+1, ipy,   ipz  )
+        ylneigh = find_proc(ipx,   ipy-1, ipz  )
+        yuneigh = find_proc(ipx,   ipy+1, ipz  )
+        zlneigh = find_proc(ipx,   ipy,   ipz-1)
+        zuneigh = find_proc(ipx,   ipy,   ipz+1)
+        llcorn = find_proc(ipx, ipy-1, ipz-1)
+        ulcorn = find_proc(ipx, ipy+1, ipz-1)
+        uucorn = find_proc(ipx, ipy+1, ipz+1)
+        lucorn = find_proc(ipx, ipy-1, ipz+1)
+      endif
+!
+      if (MPI_COMM_XBEAM   /= MPI_COMM_NULL) call MPI_COMM_FREE(MPI_COMM_XBEAM,   ierr)
+      if (MPI_COMM_YBEAM   /= MPI_COMM_NULL) call MPI_COMM_FREE(MPI_COMM_YBEAM,   ierr)
+      if (MPI_COMM_ZBEAM   /= MPI_COMM_NULL) call MPI_COMM_FREE(MPI_COMM_ZBEAM,   ierr)
+      if (MPI_COMM_XYPLANE /= MPI_COMM_NULL) call MPI_COMM_FREE(MPI_COMM_XYPLANE, ierr)
+      if (MPI_COMM_XZPLANE /= MPI_COMM_NULL) call MPI_COMM_FREE(MPI_COMM_XZPLANE, ierr)
+      if (MPI_COMM_YZPLANE /= MPI_COMM_NULL) call MPI_COMM_FREE(MPI_COMM_YZPLANE, ierr)
+
+      if (parent_comm /= MPI_COMM_GRID) then
+        if (MPI_COMM_PENCIL /= MPI_COMM_NULL) call MPI_COMM_FREE(MPI_COMM_PENCIL, ierr)
+        if (MPI_COMM_GRID   /= MPI_COMM_NULL) call MPI_COMM_FREE(MPI_COMM_GRID,   ierr)
+        call MPI_COMM_DUP(parent_comm, MPI_COMM_PENCIL, ierr)
+        call MPI_COMM_DUP(MPI_COMM_PENCIL, MPI_COMM_GRID, ierr)
+      endif
+!
+      call MPI_COMM_SPLIT(MPI_COMM_GRID, ipy+nprocy*ipz, ipx, &
+                          MPI_COMM_XBEAM, ierr)
+      call MPI_COMM_SPLIT(MPI_COMM_GRID, ipx+nprocx*ipz, ipy, &
+                          MPI_COMM_YBEAM, ierr)
+      call MPI_COMM_SPLIT(MPI_COMM_GRID, ipx+nprocx*ipy, ipz, &
+                          MPI_COMM_ZBEAM, ierr)
+      call MPI_COMM_SPLIT(MPI_COMM_GRID, ipz, ipx+nprocx*ipy, &
+                          MPI_COMM_XYPLANE, ierr)
+      call MPI_COMM_SPLIT(MPI_COMM_GRID, ipy, ipx+nprocx*ipz, &
+                          MPI_COMM_XZPLANE, ierr)
+      call MPI_COMM_SPLIT(MPI_COMM_GRID, ipx, ipy+nprocy*ipz, &
+                          MPI_COMM_YZPLANE, ierr)
+!
+    endsubroutine setup_neighbour_comms
+!***********************************************************************
+    subroutine verify_topology_after_recovery()
+!
+!  Post-recovery topology verification
+!
+      integer :: ierr, sz, active_rank, d
+      integer, parameter :: NF = 7    ! row layout: iproc, xl, xu, yl, yu, zl, zu
+      integer, parameter :: T_VERIFY = 88881
+      integer, parameter, dimension(3) :: lo_field = (/2, 4, 6/)
+      integer, parameter, dimension(3) :: up_field = (/3, 5, 7/)
+      character, parameter, dimension(3) :: dlabel = (/'x','y','z'/)
+      integer, dimension(3) :: nproc_d, lo_n, up_n
+      integer :: my_view(NF)
+      integer, allocatable :: all_views(:,:)
+      integer :: status(MPI_STATUS_SIZE), recvd
+      logical :: ok_topo, ok_global, ok_func_local, ok_func_global
+!
+      call MPI_Comm_size(MPI_COMM_GRID, sz,          ierr)
+      call MPI_Comm_rank(MPI_COMM_GRID, active_rank, ierr)
+!
+      my_view = (/iproc, xlneigh, xuneigh, ylneigh, yuneigh, zlneigh, zuneigh/)
+!
+      allocate(all_views(NF, sz))
+      call MPI_Allgather(my_view,   NF, MPI_INTEGER, &
+                         all_views, NF, MPI_INTEGER, MPI_COMM_GRID, ierr)
+!
+      write(*,'(A,I0,A,I0,A,3I3,A,6I4)') &
+        ' [ft] world_rank=', pc_world_rank, &
+        ' verify: active_rank=', active_rank, &
+        ' ipx,ipy,ipz=', ipx, ipy, ipz, &
+        ' xl,xu,yl,yu,zl,zu=', &
+        xlneigh, xuneigh, ylneigh, yuneigh, zlneigh, zuneigh
+      flush(6)
+!
+      nproc_d = (/nprocx,  nprocy,  nprocz /)
+      lo_n    = (/xlneigh, ylneigh, zlneigh/)
+      up_n    = (/xuneigh, yuneigh, zuneigh/)
+!
+      ok_topo = .true.
+      do d = 1, 3
+        if (nproc_d(d) <= 1) cycle
+        if (up_n(d) == iproc .or. lo_n(d) == iproc) ok_topo = .false.
+        if (up_n(d) < 0 .or. up_n(d) >= sz) then
+          ok_topo = .false.
+        else if (all_views(lo_field(d), up_n(d)+1) /= iproc) then
+          ok_topo = .false.
+        endif
+        if (lo_n(d) < 0 .or. lo_n(d) >= sz) then
+          ok_topo = .false.
+        else if (all_views(up_field(d), lo_n(d)+1) /= iproc) then
+          ok_topo = .false.
+        endif
+      enddo
+!
+!  Global verdict via logical AND so every rank prints the consensus.
+!
+      call MPI_Allreduce(ok_topo, ok_global, 1, MPI_LOGICAL, MPI_LAND, &
+                         MPI_COMM_GRID, ierr)
+      deallocate(all_views)
+!
+      if (.not. ok_global) then
+        write(*,'(A,I0,A)') ' [ft] world_rank=', pc_world_rank, &
+          ' verify: TOPOLOGY FAIL (cached neighbour links inconsistent)'
+        flush(6)
+        return
+      endif
+!
+!  Phase 2: functional point-to-point on MPI_COMM_GRID, one direction
+!  at a time. Send my iproc to upper, recv from lower, verify recv'd
+!  value equals lower neighbour's iproc.
+!
+      ok_func_local = .true.
+      do d = 1, 3
+        if (nproc_d(d) <= 1) cycle
+        recvd = -1
+        call MPI_Sendrecv(iproc, 1, MPI_INTEGER, up_n(d), T_VERIFY, &
+                          recvd, 1, MPI_INTEGER, lo_n(d), T_VERIFY, &
+                          MPI_COMM_GRID, status, ierr)
+        if (ierr /= MPI_SUCCESS .or. recvd /= lo_n(d)) then
+          ok_func_local = .false.
+          write(*,'(A,I0,A,A,A,I0,A,I0)') &
+            ' [ft] world_rank=', pc_world_rank, &
+            ' verify ', dlabel(d), ': FAIL recvd=', recvd, &
+            ' expected=', lo_n(d)
+          flush(6)
+        endif
+      enddo
+!
+      call MPI_Allreduce(ok_func_local, ok_func_global, 1, MPI_LOGICAL, &
+                         MPI_LAND, MPI_COMM_GRID, ierr)
+      if (ok_func_global) then
+        write(*,'(A,I0,A)') ' [ft] world_rank=', pc_world_rank, &
+          ' verify: COMM_GRID exchange OK (recovered)'
+      else
+        write(*,'(A,I0,A)') ' [ft] world_rank=', pc_world_rank, &
+          ' verify: COMM_GRID exchange FAIL'
+      endif
+      flush(6)
+!
+    endsubroutine verify_topology_after_recovery
 !***********************************************************************
     subroutine create_communicators()
 
@@ -1903,6 +2063,7 @@ if (notanumber(ubufyo)) print*, 'ubufyo: iproc=', iproc, iproc_world
       integer, optional,                 intent(in)   :: ivar1_opt, ivar2_opt
 !
       integer :: ivar1, ivar2, j
+      integer :: ft_first_err
 !
       ivar1=1; ivar2=min(mcom,size(f,4))
       if (present(ivar1_opt)) ivar1=ivar1_opt
@@ -1915,9 +2076,11 @@ if (notanumber(ubufyo)) print*, 'ubufyo: iproc=', iproc, iproc_world
 !
 !  Communication across y-planes (includes periodic bc)
 !
+      ft_first_err = MPI_SUCCESS
       if (nprocy>1.or.lyinyang) then
 
         call MPI_WAIT(irecv_rq_fromuppy,irecv_stat_fu,mpierr)
+        if (mpierr /= MPI_SUCCESS .and. ft_first_err == MPI_SUCCESS) ft_first_err = mpierr
         call MPI_WAIT(irecv_rq_fromlowy,irecv_stat_fl,mpierr)
 
         do j=ivar1,ivar2
@@ -2222,6 +2385,11 @@ if (notanumber(ubufyi(:,:,mz+1:,j))) print*, 'ubufyi(mz+1:): iproc,j=', iproc, i
 !     if (ip<7.and.ipy==3.and.lfirst_proc_z) &
 !       print*,'finalize_isendrcv_bdry: MPICOMM recv ul: ', &
 !                       iproc,ulbufi(nx/2+4,:,1,2),' from ',ulcorn
+!
+      if (ft_first_err /= MPI_SUCCESS) then
+        call ft_check(ft_first_err, MPI_COMM_GRID)
+        if (pc_need_restart_step) return
+      endif
 !
 !  make sure the other processors don't carry on sending new data
 !  which could be mistaken for an earlier time

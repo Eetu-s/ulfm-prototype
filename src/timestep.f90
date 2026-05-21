@@ -10,6 +10,7 @@
 module Timestep
 !
   use Cdata
+  use Ft_mpi, only: pc_need_restart_step
 !
   implicit none
 !
@@ -134,6 +135,14 @@ module Timestep
 !  Change df according to the chosen physics modules.
 !
         call pde(f,df,p)
+
+        if (pc_need_restart_step) then
+          pc_need_restart_step = .false.
+          if (lroot) print*, '[ft] time_step: skipping substep ', itsub, &
+                              ' after recovery; df discarded'
+          if (.not. lgpu) df=0.0
+          return
+        endif
 
         if(present(dt_)) then
           dt_used = dt_
